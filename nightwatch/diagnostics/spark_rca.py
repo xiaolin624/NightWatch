@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 from openai import OpenAI
@@ -13,6 +14,7 @@ from nightwatch.agent.prompts import SYSTEM_DIAGNOSE_INCIDENT
 from nightwatch.config import get_settings
 from nightwatch.models.api import RootCauseDiagnosis
 from nightwatch.models.incident import IncidentEvent, IncidentType, LogSnippet
+from nightwatch.retrieval.digest import build_digest, render_digest
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,17 @@ class LLMServiceError(RuntimeError):
     pass
 
 
+def _parse_event_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _build_diagnosis_user_prompt(
     snippets: list[LogSnippet],
     incident_context: dict[str, Any] | None,
@@ -51,6 +64,7 @@ def _build_diagnosis_user_prompt(
 ) -> str:
     context = incident_context or {}
     retrieval_hints = context.get("retrieval_hints", [])
+    settings = get_settings()
 
     header_lines = [
         "请基于以下上下文进行结构化 RCA：",
@@ -76,19 +90,34 @@ def _build_diagnosis_user_prompt(
                 f"score={hint.get('score', 0.0)}"
             )
 
-    header_lines.extend(["", "日志切片（按相关性输入）："])
+    raw_lines: list[str] = []
+    for snippet in snippets:
+        raw_lines.extend(snippet.content.splitlines())
 
-    body_lines: list[str] = []
-    for index, snippet in enumerate(snippets, start=1):
-        body_lines.append(
-            (
-                f"[Snippet {index}] source={snippet.source} host={snippet.host} "
-                f"offset={snippet.offset_start}-{snippet.offset_end} score={snippet.score}\n"
-                f"{snippet.content.strip()}"
-            )
-        )
+    digest = build_digest(
+        raw_lines,
+        failure_timestamp=_parse_event_time(context.get("event_time")),
+        seconds_before=settings.log_digest_seconds_before,
+        seconds_after=settings.log_digest_seconds_after,
+        max_snippets=settings.log_digest_max_snippets,
+        signature_limit=settings.log_digest_signature_limit,
+    )
 
-    user_prompt = "\n".join(header_lines + body_lines).strip()
+    header_text = "\n".join(header_lines).strip()
+    body_budget = max_prompt_chars - len(header_text) - 2
+    body_text = render_digest(digest, max_chars=max(0, body_budget))
+
+    logger.info(
+        "log digest built: lines=%d kept=%d signatures=%d ratio=%.2f chars=%d->%d",
+        digest.total_lines,
+        digest.kept_lines,
+        len(digest.signatures),
+        digest.compression_ratio,
+        digest.before_chars,
+        digest.after_chars,
+    )
+
+    user_prompt = f"{header_text}\n\n{body_text}".strip() if body_text else header_text
     if len(user_prompt) <= max_prompt_chars:
         return user_prompt
 
